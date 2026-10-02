@@ -1,0 +1,28 @@
+This repository contains modified source files from NVIDIA PhysicsNeMo
+(https://github.com/NVIDIA/physicsnemo), licensed under the Apache License,
+Version 2.0. See LICENSE for the full license text.
+
+Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+Modified files and a summary of changes (per Apache 2.0 Section 4(b)):
+
+- predict_on_stl.py (originally inference_on_stl.py)
+  - Fixed a surface-normal sign mismatch between STL-derived normals and the
+    CFD mesh's own convention (cross product operand order).
+  - Added STL subdivision for query points to correct an area/resolution
+    mismatch between the (coarser) input STL and the (finer) CFD boundary
+    mesh, with predictions averaged back onto the original faces.
+  - Added eval.compute_surface / eval.compute_volume flags to allow
+    selective surface-only or volume-only inference.
+
+- train.py
+  - Added checkpoint retention: the stock script logged the best validation
+    loss but never saved a checkpoint for it, and periodic checkpoints were
+    never pruned, risking disk exhaustion on long unattended runs. Added
+    best-checkpoint saving and periodic-checkpoint pruning.
+
+- compute_statistics.py, loss.py, utils.py: unmodified, included as-is
+  for context (referenced by the files above).
+
+See docs/domino_build_guide.html for the full narrative of why each change
+was made, including the evidence that motivated it.

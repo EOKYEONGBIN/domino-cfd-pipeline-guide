@@ -1,0 +1,202 @@
+# Combined (surface+volume) 500-case AhmedML training config (400 train /
+# 50 val / 50 test, official "full"-split-sized). Forked from
+# real_train_200.yaml, keeping the SAME architecture/loss settings
+# (pressure_magnitude_weight=5.0, surf_loss_scaling=5.0) so this run isolates
+# the effect of (a) more data and (b) the patched train.py (best-checkpoint
+# save + early stopping + checkpoint retention pruning) without ALSO
+# changing the loss function at the same time -- that keeps this run
+# comparable against the original 40-case/200-case combined models.
+#
+# Reuses the EXISTING 160 train + 24 val processed .npy as-is (already
+# combined-mode, contains real volume_fields -- confirmed 2026-09-23);
+# pipeline_500.sh downloads+processes the additional 240 train / 26 val
+# cases into the SAME data/processed/{train,val} directories alongside them.
+
+project:
+  name: AhmedML_Full500
+
+exp_tag: 1
+project_dir: outputs/${project.name}/
+output: outputs/${project.name}/${exp_tag}
+
+hydra:
+  run:
+    dir: ${output}
+  output_subdir: hydra
+
+resume_dir: ${output}/models
+
+data_processor:
+  kind: ahmedml
+  input_dir: /home/YOUR_USER/domino-ahmedml/data/raw_train
+  output_dir: /home/YOUR_USER/domino-ahmedml/data/processed/train
+  cached_dir: /home/YOUR_USER/domino-ahmedml/data/cached
+  use_cache: false
+  num_processors: 16
+
+variables:
+  surface:
+    solution:
+      pMean: scalar
+      wallShearStressMean: vector
+  volume:
+    solution:
+      UMean: vector
+      pMean: scalar
+      nutMean: scalar
+  global_parameters:
+    inlet_velocity:
+      type: vector
+      reference: [1.0]
+    air_density:
+      type: scalar
+      reference: 1.0
+
+data:
+  input_dir: /home/YOUR_USER/domino-ahmedml/data/processed/train
+  input_dir_val: /home/YOUR_USER/domino-ahmedml/data/processed/val
+  bounding_box_surface:
+    min: [-1.38, -0.32, 0.0]
+    max: [0.18, 0.32, 0.41]
+  bounding_box:
+    min: [-4.5, -1.2, -0.1]
+    max: [6.5, 1.2, 1.6]
+  gpu_preprocessing: true
+  gpu_output: true
+  normalize_coordinates: true
+  sample_in_bbox: true
+  sampling: true
+  scaling_factors: ${project_dir}/scaling_factors/scaling_factors.pkl
+  volume_sample_from_disk: false
+  max_samples_for_statistics: 400  # 400 train cases (160 original + 240 new)
+
+domain_parallelism:
+  domain_size: 1
+  shard_grid: false
+  shard_points: false
+
+model:
+  model_type: combined
+  activation: "gelu"
+  loss_function:
+    loss_type: "mse"
+    area_weighing_factor: 10000
+    pressure_magnitude_weight: 5.0
+  interp_res: [128, 64, 64]
+  use_sdf_in_basis_func: true
+  volume_points_sample: 8192
+  surface_points_sample: 8192
+  surface_sampling_algorithm: area_weighted
+  geom_points_sample: 65_000
+  num_neighbors_surface: 7
+  num_neighbors_volume: 10
+  combine_volume_surface: false
+  return_volume_neighbors: false
+  use_surface_normals: true
+  use_surface_area: true
+  integral_loss_scaling_factor: 100
+  normalization: min_max_scaling
+  encode_parameters: false
+  surf_loss_scaling: 5.0
+  vol_loss_scaling: 1.0
+  geometry_encoding_type: both
+  solution_calculation_mode: two-loop
+  geometry_rep:
+    geo_conv:
+      base_neurons: 32
+      base_neurons_in: 1
+      base_neurons_out: 1
+      volume_radii: [0.1, 0.5, 1.0, 2.5]
+      surface_radii: [0.01, 0.05, 1.0]
+      surface_hops: 1
+      volume_hops: 1
+      volume_neighbors_in_radius: [32, 64, 128, 256]
+      surface_neighbors_in_radius: [8, 16, 128]
+      fourier_features: false
+      num_modes: 5
+      activation: ${model.activation}
+    geo_processor:
+      base_filters: 8
+      activation: ${model.activation}
+      processor_type: conv
+      self_attention: false
+      cross_attention: false
+      surface_sdf_scaling_factor: [0.01, 0.02, 0.04]
+      volume_sdf_scaling_factor: [0.04]
+  nn_basis_functions:
+    base_layer: 512
+    fourier_features: true
+    num_modes: 5
+    activation: ${model.activation}
+  local_point_conv:
+    activation: ${model.activation}
+  aggregation_model:
+    base_layer: 512
+    activation: ${model.activation}
+  position_encoder:
+    base_neurons: 512
+    activation: ${model.activation}
+    fourier_features: true
+    num_modes: 5
+  geometry_local:
+    volume_neighbors_in_radius: [64, 128]
+    surface_neighbors_in_radius: [32, 128]
+    volume_radii: [0.1, 0.25]
+    surface_radii: [0.05, 0.25]
+    base_layer: 512
+  parameter_model:
+    base_layer: 512
+    fourier_features: false
+    num_modes: 5
+    activation: ${model.activation}
+
+train:
+  epochs: 1000
+  early_stopping_patience: 100
+  checkpoint_keep_last: 5
+  checkpoint_interval: 2
+  dataloader:
+    batch_size: 1
+    preload_depth: 1
+    pin_memory: true
+  sampler:
+    shuffle: true
+    drop_last: false
+  checkpoint_dir: /user/models/
+  add_physics_loss: false
+  lr_scheduler:
+    name: MultiStepLR
+    milestones: [50, 200, 400, 500, 600, 700, 800, 900]
+    gamma: 0.5
+    T_max: ${train.epochs}
+    eta_min: 1e-6
+  optimizer:
+    name: Adam
+    lr: 0.001
+    weight_decay: 0.0
+  amp:
+    enabled: false
+    autocast:
+      dtype: torch.float16
+    scaler:
+      _target_: torch.amp.GradScaler
+      enabled: ${..enabled}
+    clip_grad: true
+    grad_max_norm: 2.0
+
+val:
+  dataloader:
+    batch_size: 1
+    preload_depth: 1
+    pin_memory: true
+  sampler:
+    shuffle: true
+    drop_last: false
+
+eval:
+  test_path: /home/YOUR_USER/domino-ahmedml/data/raw_test
+  save_path: /home/YOUR_USER/domino-ahmedml/predictions
+  checkpoint_name: DoMINO.0.9.mdlus
+  scaling_param_path: /home/YOUR_USER/domino-ahmedml/outputs/AhmedML_Full500
+  refine_stl: False
+  num_points: 50_000
