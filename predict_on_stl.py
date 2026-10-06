@@ -369,11 +369,11 @@ def inference_surface_mesh_on_single_stl(
     datapipe: DoMINODataPipe,
 ):
     """
-    Evaluate the model at EVERY face of the STL (not a random 8192-point
-    subsample), chunked through the model in batches of
-    datapipe.config.surface_points_sample, and reassembled in the original
-    face order -- so the output can reuse the STL's own triangle
-    connectivity (CreateCaeVizFaces), matching how the ground-truth
+    Evaluate the model at EVERY face of a 1-level subdivided copy of the STL
+    (not a random 8192-point subsample), chunked through the model in batches
+    of datapipe.config.surface_points_sample. Returns
+    (subdivided_vertices, subdivided_faces, per_face_output) so the output
+    has real triangle connectivity (CreateCaeVizFaces), matching how the ground-truth
     boundary_*.vtp examples work, instead of being a disconnected point
     cloud limited to one subsampled batch (CreateCaeVizPoints; see
     inference_on_single_stl/save_surface_prediction).
@@ -436,19 +436,19 @@ def inference_surface_mesh_on_single_stl(
     # the CFD mesh's own normals/areas directly) -- purely geometric, no
     # ground-truth data used, so it applies to a genuinely new/unseen
     # geometry too. 1 level of linear subdivision splits each triangle into
-    # 4, landing very close to the CFD mesh's resolution for AhmedML; each
-    # subdivided face's prediction is averaged back to its ORIGINAL parent
-    # face afterward, since Kit-CAE's Faces operator needs one value per
-    # original STL face (and save_surface_mesh_prediction builds its VTP
-    # from the original stl_coordinates/stl_faces).
+    # 4, landing very close to the CFD mesh's resolution for AhmedML.
+    #
+    # The subdivided mesh itself is returned and saved (2026-10-06): it used
+    # to be averaged back onto the original STL faces, which threw away the
+    # finer result and showed visibly coarser, stair-stepped color bands than
+    # the CFD boundary mesh in Kit-CAE (run_10 front: ~3.1mm STL faces vs
+    # ~1.2mm CFD cells).
     faces_np = stl_faces.reshape((-1, 3)).detach().cpu().numpy().astype(np.int64)
     faces_flat = np.hstack(
         [np.full((n_orig_faces, 1), 3, dtype=np.int64), faces_np]
     ).reshape(-1)
     subdiv_mesh = pv.PolyData(stl_coordinates.detach().cpu().numpy(), faces_flat)
-    subdiv_mesh.cell_data["orig_id"] = np.arange(n_orig_faces)
     subdiv_mesh = subdiv_mesh.subdivide(1, subfilter="linear")
-    orig_id = torch.from_numpy(subdiv_mesh.cell_data["orig_id"].astype(np.int64)).to(device)
 
     sub_verts = torch.from_numpy(subdiv_mesh.points).to(device=device, dtype=stl_coordinates.dtype)
     sub_faces_idx = torch.from_numpy(
@@ -547,45 +547,61 @@ def inference_surface_mesh_on_single_stl(
         matched_face_idx = chunk_indices[nearest]
         output_full[matched_face_idx] = output_surf
 
-    # Average each subdivided face's prediction back to its ORIGINAL parent
-    # face (see the AUDIT FIX comment above output_full's return type/shape
-    # must match n_orig_faces for save_surface_mesh_prediction).
-    output_orig = torch.zeros(
-        (n_orig_faces, output_full.shape[-1]), device=device, dtype=output_full.dtype
-    )
-    counts = torch.zeros(n_orig_faces, device=device, dtype=output_full.dtype)
-    output_orig.index_add_(0, orig_id, output_full)
-    counts.index_add_(0, orig_id, torch.ones(num_faces, device=device, dtype=output_full.dtype))
-    output_orig /= counts.clamp(min=1).unsqueeze(1)
-
-    return output_orig
+    return sub_verts, sub_faces_idx, output_full
 
 
 def save_surface_mesh_prediction(
-    stl_coordinates: torch.Tensor,
-    stl_faces: torch.Tensor,
+    verts: torch.Tensor,
+    faces: torch.Tensor,
     output_full: torch.Tensor,
     surface_solution_cfg: dict,
     output_path: str,
 ) -> None:
     """
-    Write predicted surface fields as per-face (cell) data on the STL's own
-    mesh -- real triangle connectivity, so Kit-CAE's Faces operator can be
-    used directly instead of Points.
+    Write predicted surface fields on the (subdivided) query mesh -- real
+    triangle connectivity, so Kit-CAE's Faces operator can be used directly
+    instead of Points. Each field is stored twice:
+
+    - point data, under the field's own name (e.g. "pMean"): area-weighted
+      average of the faces around each vertex. Kit-CAE colors point data with
+      vertex interpolation, so color varies smoothly across each triangle
+      instead of one flat color per face. This is what the Kit-CAE extension
+      selects for coloring.
+    - cell data, as "<name>_cell": the raw per-face prediction, for accuracy
+      evaluation against CFD cell data (no smoothing applied).
     """
-    verts_np = stl_coordinates.detach().cpu().numpy()
-    faces_np = stl_faces.reshape((-1, 3)).detach().cpu().numpy()
+    verts_np = verts.detach().cpu().numpy()
+    faces_np = faces.reshape((-1, 3)).detach().cpu().numpy().astype(np.int64)
     n_faces = faces_np.shape[0]
     faces_flat = np.hstack(
         [np.full((n_faces, 1), 3, dtype=np.int64), faces_np]
     ).reshape(-1)
     mesh = pv.PolyData(verts_np, faces_flat)
 
+    # Area weights: zero-area (degenerate) faces, which also carry no
+    # prediction, drop out of the vertex averages on their own.
+    tri = verts_np[faces_np]
+    areas = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    weight_sum = np.zeros(verts_np.shape[0])
+    for k in range(3):
+        np.add.at(weight_sum, faces_np[:, k], areas)
+
+    def to_points(cell_values: np.ndarray) -> np.ndarray:
+        cell_values = cell_values.reshape(n_faces, -1)
+        acc = np.zeros((verts_np.shape[0], cell_values.shape[1]))
+        weighted = cell_values * areas[:, None]
+        for k in range(3):
+            np.add.at(acc, faces_np[:, k], weighted)
+        out = acc / np.maximum(weight_sum, 1e-30)[:, None]
+        return out.astype(np.float32).squeeze()
+
     results_np = output_full.detach().cpu().numpy()
     offset = 0
     for name, kind in surface_solution_cfg.items():
         dim = 3 if kind == "vector" else 1
-        mesh.cell_data[name] = results_np[:, offset : offset + dim]
+        cell_values = results_np[:, offset : offset + dim]
+        mesh.cell_data[f"{name}_cell"] = cell_values
+        mesh.point_data[name] = to_points(cell_values)
         offset += dim
 
     # Cp = (p - p_ref) / (0.5 * rho * U_inf^2); AhmedML's global_parameters
@@ -596,8 +612,9 @@ def save_surface_mesh_prediction(
     # static(p)_coeffMean fields (min/max matched 2*pMean almost exactly).
     # Not a model output -- a plain linear derivation from the already
     # -predicted pMean, so no retraining/re-inference is needed for this.
-    if "pMean" in mesh.cell_data:
-        mesh.cell_data["static(p)_coeffMean"] = 2.0 * mesh.cell_data["pMean"]
+    if "pMean" in mesh.point_data:
+        mesh.point_data["static(p)_coeffMean"] = 2.0 * mesh.point_data["pMean"]
+        mesh.cell_data["static(p)_coeffMean_cell"] = 2.0 * mesh.cell_data["pMean_cell"]
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     # Testing binary (default) instead of ASCII here -- suspect ASCII +
@@ -1075,7 +1092,7 @@ def inference_epoch(
         # Save the outputs to file:
         ######################################################
         if surface_solution_cfg is not None and save_path is not None:
-            surface_output_full = inference_surface_mesh_on_single_stl(
+            sub_verts, sub_faces, surface_output_full = inference_surface_mesh_on_single_stl(
                 sample_batched["stl_coordinates"],
                 sample_batched["stl_faces"],
                 sample_batched["global_params_values"],
@@ -1085,8 +1102,8 @@ def inference_epoch(
             )
             case_output_path = os.path.join(save_path, f"prediction_{i_batch}.vtp")
             save_surface_mesh_prediction(
-                sample_batched["stl_coordinates"],
-                sample_batched["stl_faces"],
+                sub_verts,
+                sub_faces,
                 surface_output_full,
                 surface_solution_cfg,
                 case_output_path,

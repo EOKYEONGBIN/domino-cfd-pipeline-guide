@@ -420,12 +420,16 @@ print(dot.mean())   # -1에 가까우면 부호가 반대 -> 뒤집어야 함</c
   <pre><code># 수정: cross product 피연산자 순서를 바꾸면 부호가 반전됨
 normal = torch.linalg.cross(d2, d1, dim=1)   # (d1, d2) 순서였다면 뒤집기</code></pre>
 
-  <p><strong>함정 2 - 면적 해상도.</strong> STL이 CFD 메시보다 거칠면(면 개수가 적으면) 각 면의 넓이가 실제보다 크게 계산됩니다. 정답 데이터 없이도 고칠 수 있습니다 - STL을 한 단계 세분화(subdivide)해서 CFD 해상도에 가깝게 만들고, 그 조밀한 점에서 예측한 뒤 원래 면으로 평균을 되돌립니다:</p>
+  <p><strong>함정 2 - 면적 해상도.</strong> STL이 CFD 메시보다 거칠면(면 개수가 적으면) 각 면의 넓이가 실제보다 크게 계산됩니다. 정답 데이터 없이도 고칠 수 있습니다 - STL을 한 단계 세분화(subdivide)해서 CFD 해상도에 가깝게 만들고, 그 조밀한 메시에서 예측한 뒤 <strong>세분화된 메시 그대로</strong> 저장합니다:</p>
   <pre><code>import pyvista as pv
 mesh = pv.PolyData(vertices, faces)
-mesh.cell_data["orig_id"] = range(mesh.n_cells)
 fine = mesh.subdivide(1, subfilter="linear")   # 삼각형 1개 -> 4개
-# fine 메시의 중심점/법선/면적으로 예측한 뒤, orig_id로 평균 내서 원래 면 개수로 되돌림</code></pre>
+# fine 메시의 면 중심점/법선/면적으로 예측하고, fine 메시 위에 결과를 저장</code></pre>
+
+  <div class="callout warn">
+    <div class="tag">경고: 원래 STL 면으로 평균 내서 저장하면 거칠게 보입니다</div>
+    <p>처음에는 세분화한 결과를 원래 STL 면으로 다시 평균 내서 저장했습니다. 그랬더니 Kit-CAE에서 CFD 결과와 나란히 볼 때 색 경계가 계단처럼 각지고 점무늬가 보였습니다. run_10 기준으로 앞부분 면 크기가 CFD 1.2mm 대비 3.1mm였고, 이웃 면끼리의 값 차이도 CFD의 약 3배였습니다. 세분화한 메시(78만 면) 그대로 저장하고 아래처럼 꼭짓점 값까지 넣으니 면 크기 1.5mm, 이웃 차이도 크게 줄었고, 정확도(R²)는 그대로였습니다. 대신 결과 파일은 6MB에서 32MB로 커집니다.</p>
+  </div>
 
   <div class="callout warn">
     <div class="tag">경고: 이 검증을 생략하면</div>
@@ -436,8 +440,9 @@ fine = mesh.subdivide(1, subfilter="linear")   # 삼각형 1개 -> 4개
   <p class="step-why">모델이 뱉는 건 그냥 숫자 텐서(<span class="path">(면 개수, 필드 차원)</span> 크기의 숫자 표, <span class="path">.pt</span>/<span class="path">.npy</span>가 저장하는 것과 같은 종류) 하나뿐입니다. 어떤 메시 위에, 어떤 이름으로, 점 데이터인지 면 데이터인지는 그 표 자체엔 없는 정보라서 프레임워크가 몰라서 정해주지 못합니다 - VTP 파일 구조를 직접 조립해야 합니다.</p>
 
   <ol style="padding-left:20px;font-size:14.5px;color:var(--text);">
-    <li>추론에 쓴 <strong>원본 STL의 정점, 면 연결정보</strong>로 <span class="path">pyvista.PolyData</span>를 새로 만듭니다 (추론에 쓴 subdivide된 메시가 아니라 <strong>원본</strong> - 뷰어가 사용자가 올린 그 형상 그대로 보게 하려면).</li>
-    <li>재조립된 출력 텐서를 <span class="path">mesh.cell_data["필드이름"]</span>에 컬럼 단위로 나눠 씁니다 (scalar=1열, vector=3열) - <strong>face당 값 하나</strong>이므로 <span class="path">cell_data</span>입니다. 정점당 값(<span class="path">point_data</span>)을 쓰면 안 됩니다 - 필드가 면(face) 중심에서 계산된 것이라서 방식이 다릅니다.</li>
+    <li>추론에 쓴 <strong>세분화된 메시의 정점, 면 연결정보</strong>로 <span class="path">pyvista.PolyData</span>를 만듭니다. 형상은 원본 STL과 같고 면만 4배로 쪼개져 있습니다.</li>
+    <li>모델 출력은 <strong>면 중심마다 값 하나</strong>라서, 원래 값은 <span class="path">cell_data</span>에 씁니다 (scalar=1열, vector=3열). 저희는 <span class="path">pMean_cell</span>처럼 이름 뒤에 <span class="path">_cell</span>을 붙여 정확도 평가용으로 보존합니다.</li>
+    <li>보기 좋게 표시하려면 각 꼭짓점에 <strong>주변 면 값의 면적 가중 평균</strong>을 계산해 <span class="path">point_data</span>에 원래 이름(<span class="path">pMean</span>)으로 씁니다. Kit-CAE는 꼭짓점 데이터를 면 안에서 부드럽게 이어 칠하므로, 면마다 한 색으로 칠할 때 생기는 계단 무늬가 사라집니다. 같은 이름을 면 데이터와 꼭짓점 데이터 양쪽에 두면 뷰어가 어느 쪽을 쓸지 애매해지므로 이름을 나눴습니다.</li>
     <li>모델이 직접 내놓지 않은 파생값(예: 압력계수 <span class="path">Cp = 2 * pMean</span>, 무차원 컨벤션에서)은 저장 직전에 여기서 한 번 더 계산해 추가 필드로 넣습니다.</li>
     <li><span class="path">mesh.save("prediction.vtp")</span> - VTK가 실제 파일 쓰기를 담당합니다.</li>
   </ol>
@@ -446,16 +451,15 @@ fine = mesh.subdivide(1, subfilter="linear")   # 삼각형 1개 -> 4개
   <pre><code>import pyvista as pv
 import numpy as np
 
-def save_surface_prediction(stl_coordinates, stl_faces, output_full,
-                             field_spec, output_path):
+def save_surface_prediction(verts, faces, output_full, field_spec, output_path):
     """
-    stl_coordinates : (N_verts, 3)  원본 STL 정점
-    stl_faces       : (N_faces*3,)  원본 STL 면 연결정보 (평탄화됨)
-    output_full     : (N_faces, D)  재조립된 모델 출력 (face 순서 = 원본 STL과 동일)
-    field_spec      : 예) {"pMean": "scalar", "wallShearStressMean": "vector"}
+    verts       : (N_verts, 3)  세분화된 메시의 정점
+    faces       : (N_faces, 3)  세분화된 메시의 면 연결정보
+    output_full : (N_faces, D)  면마다의 모델 출력 (faces와 같은 순서)
+    field_spec  : 예) {"pMean": "scalar", "wallShearStressMean": "vector"}
     """
-    verts = stl_coordinates.cpu().numpy()
-    faces = stl_faces.reshape(-1, 3).cpu().numpy()
+    verts = verts.cpu().numpy()
+    faces = faces.reshape(-1, 3).cpu().numpy()
     n_faces = faces.shape[0]
     # VTK의 face 배열 형식: [정점개수, i0,i1,i2, 정점개수, i0,i1,i2, ...]
     faces_flat = np.hstack(
@@ -463,22 +467,39 @@ def save_surface_prediction(stl_coordinates, stl_faces, output_full,
     ).reshape(-1)
     mesh = pv.PolyData(verts, faces_flat)
 
+    # 꼭짓점 값 = 주변 면 값의 면적 가중 평균 (면적 0인 면은 저절로 빠짐)
+    tri = verts[faces]
+    areas = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    w = np.zeros(len(verts))
+    for k in range(3):
+        np.add.at(w, faces[:, k], areas)
+
+    def to_points(vals):
+        acc = np.zeros((len(verts), vals.shape[1]))
+        for k in range(3):
+            np.add.at(acc, faces[:, k], vals * areas[:, None])
+        return (acc / np.maximum(w, 1e-30)[:, None]).squeeze()
+
     results = output_full.cpu().numpy()
     offset = 0
     for name, kind in field_spec.items():
         dim = 3 if kind == "vector" else 1
-        mesh.cell_data[name] = results[:, offset:offset + dim]   # face당 값 하나
+        vals = results[:, offset:offset + dim]
+        mesh.cell_data[f"{name}_cell"] = vals    # 원래 값: 면마다 하나 (평가용)
+        mesh.point_data[name] = to_points(vals)  # 표시용: 꼭짓점마다 하나
         offset += dim
 
     # 모델이 직접 내놓지 않은 파생 필드는 여기서 계산
-    if "pMean" in mesh.cell_data:
-        mesh.cell_data["static(p)_coeffMean"] = 2.0 * mesh.cell_data["pMean"]
+    if "pMean" in mesh.point_data:
+        mesh.point_data["static(p)_coeffMean"] = 2.0 * mesh.point_data["pMean"]
+        mesh.cell_data["static(p)_coeffMean_cell"] = 2.0 * mesh.cell_data["pMean_cell"]
 
     mesh.save(output_path)   # 기본이 바이너리 저장 -- 뷰어 호환성 이유는 아래 참고</code></pre>
 
   <div class="callout warn">
     <div class="tag">경고: 실제로 겪은 저장/호환성 함정</div>
     <ul>
+      <li><strong>색상 범위는 뷰어가 데이터마다 자동으로 맞춤</strong> - Kit-CAE Faces는 기본적으로 각 데이터의 최솟값~최댓값으로 색을 펼치므로, CFD 결과와 예측을 나란히 비교할 때는 두 Faces 모두 Rescale Mode를 <span class="path">disable</span>로 바꾸고 <span class="path">Materials/ScalarColor/Shader</span>의 <span class="path">domain</span>을 같은 값으로 고정해야 같은 압력이 같은 색으로 보입니다</li>
       <li><strong>ASCII로 저장하면</strong> 일부 뷰어(Kit-CAE 등)에서 cell-data 색칠이 안 먹힘 - <span class="path">mesh.save(path, binary=True)</span>(기본값)를 명시적으로 유지할 것</li>
       <li><strong>빈 위상 요소</strong>(Verts/Lines/Strips 블록이 0개인 채로 헤더에 남는 경우) 때문에 import가 조용히 실패하는 뷰어가 있음 - 저장 후 VTK 텍스트 헤더를 열어 빈 블록을 지우는 후처리 한 단계가 필요할 수 있음</li>
       <li>체적(volume) 격자 출력은 메시가 아니라 규칙적인 격자이므로 <span class="path">pyvista.ImageData</span> + <span class="path">.vti</span> 확장자 + <span class="path">point_data</span>를 씁니다 - 표면(surface) 출력과 저장 방식 자체가 다릅니다</li>
