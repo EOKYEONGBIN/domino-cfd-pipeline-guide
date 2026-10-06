@@ -560,15 +560,9 @@ def save_surface_mesh_prediction(
     """
     Write predicted surface fields on the (subdivided) query mesh -- real
     triangle connectivity, so Kit-CAE's Faces operator can be used directly
-    instead of Points. Each field is stored twice:
-
-    - point data, under the field's own name (e.g. "pMean"): area-weighted
-      average of the faces around each vertex. Kit-CAE colors point data with
-      vertex interpolation, so color varies smoothly across each triangle
-      instead of one flat color per face. This is what the Kit-CAE extension
-      selects for coloring.
-    - cell data, as "<name>_cell": the raw per-face prediction, for accuracy
-      evaluation against CFD cell data (no smoothing applied).
+    instead of Points. Each field is stored as cell data under its own name
+    (e.g. "pMean"), one value per face, the same layout as the CFD
+    boundary_*.vtp files.
     """
     verts_np = verts.detach().cpu().numpy()
     faces_np = faces.reshape((-1, 3)).detach().cpu().numpy().astype(np.int64)
@@ -578,30 +572,11 @@ def save_surface_mesh_prediction(
     ).reshape(-1)
     mesh = pv.PolyData(verts_np, faces_flat)
 
-    # Area weights: zero-area (degenerate) faces, which also carry no
-    # prediction, drop out of the vertex averages on their own.
-    tri = verts_np[faces_np]
-    areas = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
-    weight_sum = np.zeros(verts_np.shape[0])
-    for k in range(3):
-        np.add.at(weight_sum, faces_np[:, k], areas)
-
-    def to_points(cell_values: np.ndarray) -> np.ndarray:
-        cell_values = cell_values.reshape(n_faces, -1)
-        acc = np.zeros((verts_np.shape[0], cell_values.shape[1]))
-        weighted = cell_values * areas[:, None]
-        for k in range(3):
-            np.add.at(acc, faces_np[:, k], weighted)
-        out = acc / np.maximum(weight_sum, 1e-30)[:, None]
-        return out.astype(np.float32).squeeze()
-
     results_np = output_full.detach().cpu().numpy()
     offset = 0
     for name, kind in surface_solution_cfg.items():
         dim = 3 if kind == "vector" else 1
-        cell_values = results_np[:, offset : offset + dim]
-        mesh.cell_data[f"{name}_cell"] = cell_values
-        mesh.point_data[name] = to_points(cell_values)
+        mesh.cell_data[name] = results_np[:, offset : offset + dim]
         offset += dim
 
     # Cp = (p - p_ref) / (0.5 * rho * U_inf^2); AhmedML's global_parameters
@@ -612,9 +587,8 @@ def save_surface_mesh_prediction(
     # static(p)_coeffMean fields (min/max matched 2*pMean almost exactly).
     # Not a model output -- a plain linear derivation from the already
     # -predicted pMean, so no retraining/re-inference is needed for this.
-    if "pMean" in mesh.point_data:
-        mesh.point_data["static(p)_coeffMean"] = 2.0 * mesh.point_data["pMean"]
-        mesh.cell_data["static(p)_coeffMean_cell"] = 2.0 * mesh.cell_data["pMean_cell"]
+    if "pMean" in mesh.cell_data:
+        mesh.cell_data["static(p)_coeffMean"] = 2.0 * mesh.cell_data["pMean"]
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     # Testing binary (default) instead of ASCII here -- suspect ASCII +

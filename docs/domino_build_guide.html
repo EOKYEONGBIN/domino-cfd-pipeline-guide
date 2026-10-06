@@ -428,7 +428,8 @@ fine = mesh.subdivide(1, subfilter="linear")   # 삼각형 1개 -> 4개
 
   <div class="callout warn">
     <div class="tag">경고: 원래 STL 면으로 평균 내서 저장하면 거칠게 보입니다</div>
-    <p>처음에는 세분화한 결과를 원래 STL 면으로 다시 평균 내서 저장했습니다. 그랬더니 Kit-CAE에서 CFD 결과와 나란히 볼 때 색 경계가 계단처럼 각지고 점무늬가 보였습니다. run_10 기준으로 앞부분 면 크기가 CFD 1.2mm 대비 3.1mm였고, 이웃 면끼리의 값 차이도 CFD의 약 3배였습니다. 세분화한 메시(78만 면) 그대로 저장하고 아래처럼 꼭짓점 값까지 넣으니 면 크기 1.5mm, 이웃 차이도 크게 줄었고, 정확도(R²)는 그대로였습니다. 대신 결과 파일은 6MB에서 32MB로 커집니다.</p>
+    <p>처음에는 세분화한 결과를 원래 STL 면으로 다시 평균 내서 저장했습니다. 그랬더니 Kit-CAE에서 CFD 결과와 나란히 볼 때 색 경계가 계단처럼 각지고 점무늬가 보였습니다. run_10 기준으로 앞부분 면 크기가 CFD 1.2mm 대비 3.1mm였고, 이웃 면끼리의 값 차이도 CFD의 약 3배였습니다. 세분화한 메시(78만 면) 그대로 저장하니 면 크기가 1.5mm로 CFD에 가까워졌고, 정확도(R²)는 그대로였습니다. 대신 결과 파일은 6MB에서 23MB로 커집니다. 값이 급하게 바뀌는 경계가 CFD만큼 매끈하지 않은 것은 해상도가 아니라 예측값 자체가 이웃끼리 조금씩 어긋나기 때문이라, 면을 더 쪼개도 사라지지 않습니다.</p>
+    <p>꼭짓점마다 주변 면 값을 평균 낸 <span class="path">point_data</span>를 추가해 부드럽게 보이게 하는 방법도 시도했지만, Kit-CAE에서 색이 제대로 표시되지 않아(한 가지 색으로만 보임) 쓰지 않습니다.</p>
   </div>
 
   <div class="callout warn">
@@ -441,8 +442,7 @@ fine = mesh.subdivide(1, subfilter="linear")   # 삼각형 1개 -> 4개
 
   <ol style="padding-left:20px;font-size:14.5px;color:var(--text);">
     <li>추론에 쓴 <strong>세분화된 메시의 정점, 면 연결정보</strong>로 <span class="path">pyvista.PolyData</span>를 만듭니다. 형상은 원본 STL과 같고 면만 4배로 쪼개져 있습니다.</li>
-    <li>모델 출력은 <strong>면 중심마다 값 하나</strong>라서, 원래 값은 <span class="path">cell_data</span>에 씁니다 (scalar=1열, vector=3열). 저희는 <span class="path">pMean_cell</span>처럼 이름 뒤에 <span class="path">_cell</span>을 붙여 정확도 평가용으로 보존합니다.</li>
-    <li>보기 좋게 표시하려면 각 꼭짓점에 <strong>주변 면 값의 면적 가중 평균</strong>을 계산해 <span class="path">point_data</span>에 원래 이름(<span class="path">pMean</span>)으로 씁니다. Kit-CAE는 꼭짓점 데이터를 면 안에서 부드럽게 이어 칠하므로, 면마다 한 색으로 칠할 때 생기는 계단 무늬가 사라집니다. 같은 이름을 면 데이터와 꼭짓점 데이터 양쪽에 두면 뷰어가 어느 쪽을 쓸지 애매해지므로 이름을 나눴습니다.</li>
+    <li>모델 출력은 <strong>면 중심마다 값 하나</strong>라서 <span class="path">cell_data</span>에 원래 이름(<span class="path">pMean</span> 등) 그대로 씁니다 (scalar=1열, vector=3열). 정답 CFD 파일(<span class="path">boundary_N.vtp</span>)과 같은 형식이라 뷰어 설정과 정확도 비교를 그대로 쓸 수 있습니다.</li>
     <li>모델이 직접 내놓지 않은 파생값(예: 압력계수 <span class="path">Cp = 2 * pMean</span>, 무차원 컨벤션에서)은 저장 직전에 여기서 한 번 더 계산해 추가 필드로 넣습니다.</li>
     <li><span class="path">mesh.save("prediction.vtp")</span> - VTK가 실제 파일 쓰기를 담당합니다.</li>
   </ol>
@@ -467,32 +467,16 @@ def save_surface_prediction(verts, faces, output_full, field_spec, output_path):
     ).reshape(-1)
     mesh = pv.PolyData(verts, faces_flat)
 
-    # 꼭짓점 값 = 주변 면 값의 면적 가중 평균 (면적 0인 면은 저절로 빠짐)
-    tri = verts[faces]
-    areas = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
-    w = np.zeros(len(verts))
-    for k in range(3):
-        np.add.at(w, faces[:, k], areas)
-
-    def to_points(vals):
-        acc = np.zeros((len(verts), vals.shape[1]))
-        for k in range(3):
-            np.add.at(acc, faces[:, k], vals * areas[:, None])
-        return (acc / np.maximum(w, 1e-30)[:, None]).squeeze()
-
     results = output_full.cpu().numpy()
     offset = 0
     for name, kind in field_spec.items():
         dim = 3 if kind == "vector" else 1
-        vals = results[:, offset:offset + dim]
-        mesh.cell_data[f"{name}_cell"] = vals    # 원래 값: 면마다 하나 (평가용)
-        mesh.point_data[name] = to_points(vals)  # 표시용: 꼭짓점마다 하나
+        mesh.cell_data[name] = results[:, offset:offset + dim]   # face당 값 하나
         offset += dim
 
     # 모델이 직접 내놓지 않은 파생 필드는 여기서 계산
-    if "pMean" in mesh.point_data:
-        mesh.point_data["static(p)_coeffMean"] = 2.0 * mesh.point_data["pMean"]
-        mesh.cell_data["static(p)_coeffMean_cell"] = 2.0 * mesh.cell_data["pMean_cell"]
+    if "pMean" in mesh.cell_data:
+        mesh.cell_data["static(p)_coeffMean"] = 2.0 * mesh.cell_data["pMean"]
 
     mesh.save(output_path)   # 기본이 바이너리 저장 -- 뷰어 호환성 이유는 아래 참고</code></pre>
 
