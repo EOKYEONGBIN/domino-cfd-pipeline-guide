@@ -38,13 +38,39 @@
 | `utils.py` | 공통 유틸리티 (공식 예제, 수정 없음) |
 | `configs/real_train_500.yaml` | 500-case 학습 설정 예시 |
 | `scripts/run_prediction.sh` | 원격 추론 요청 스크립트 예시 (Kit-CAE 연동용) |
+| `scripts/patch_physicsnemo.py` | physicsnemo 2.2.2의 `VTKFileReader` 버그 패치 (아래 "꼭 필요한 두 가지" 참고) |
 | `docs/domino_build_guide.html` | 환경 설치부터 로컬 배포까지, 전체 과정을 처음부터 끝까지 직접 구축하는 11단계 가이드 |
 
 ## 전제 조건
 
-- NVIDIA GPU (학습은 VRAM 24GB+ 권장, 추론은 8GB 내외로도 가능)
-- Linux (PhysicsNeMo/warp-lang의 공식 지원 플랫폼)
-- `pip install nvidia-physicsnemo`
+- NVIDIA GPU (학습 시 VRAM 약 36GB 사용 실측 → 48GB급 권장, 추론은 1회 약 5GB)
+- Linux 또는 Windows + WSL2 (PhysicsNeMo/warp-lang의 공식 지원 플랫폼은 Linux)
+- 실제로 검증한 버전:
+
+```bash
+pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu130
+pip install nvidia-physicsnemo==2.2.2
+pip install cuml-cu13==26.8.0 --extra-index-url=https://pypi.nvidia.com
+python scripts/patch_physicsnemo.py
+```
+
+### 꼭 필요한 두 가지 (빠뜨리면 추론이 실패함)
+
+1. **physicsnemo 2.2.2 패치 — `scripts/patch_physicsnemo.py`**
+   physicsnemo 2.2.2의 `VTKFileReader`에 `read_file_attributes`가 빠져 있어서, 그대로 설치하면
+   STL 추론이 바로 실패합니다.
+   ```
+   TypeError: Can't instantiate abstract class VTKFileReader without an implementation
+   for abstract method 'read_file_attributes'
+   ```
+   설치한 환경에서 `python scripts/patch_physicsnemo.py`를 한 번 실행하면 고쳐집니다. 원본은
+   `cae_dataset.py.orig`로 남고, 여러 번 실행해도 안전합니다.
+
+2. **cuML 설치 — `cuml-cu13`**
+   physicsnemo는 최근접 이웃(kNN) 검색에 GPU에서는 cuML을 우선 쓰고, 없으면 **모든 점 쌍의 거리를
+   한 번에 계산하는 PyTorch 구현**으로 대체합니다. 이 대체 구현은 메모리를 크게 써서, 실측 결과
+   12GB GPU(RTX 5070 Ti Laptop)에서 추론 중 `CUDA out of memory`로 멈췄습니다. cuML을 설치하면
+   같은 GPU에서 정상 동작합니다. 실제 학습/추론 서버(A6000)도 cuML이 설치된 상태였습니다.
 
 자세한 환경 설치 과정(드라이버, PyTorch, venv 등)은 `docs/domino_build_guide.html`의 1단계를 참고하세요.
 

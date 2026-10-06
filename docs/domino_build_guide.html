@@ -130,10 +130,10 @@
   <h1 class="title">DoMINO CFD 예측 파이프라인, 직접 구축하기</h1>
   <p class="lede">AI(DoMINO)로 자동차 형상의 표면 압력을 예측하고 Kit-CAE에서 시각화하는 파이프라인을 처음부터 끝까지 직접 만드는 순서입니다. 각 단계는 실제로 이 파이프라인을 만들며 겪었던 문제들을 바탕으로, <strong>처음부터 올바르게</strong> 하는 방법을 안내합니다 - 나중에 겪을 함정을 미리 표시해뒀습니다.</p>
   <div class="req-grid">
-    <div class="req-card"><div class="k">GPU</div><div class="v">NVIDIA, VRAM 24GB+ (학습)</div></div>
+    <div class="req-card"><div class="k">GPU</div><div class="v">NVIDIA, 학습 VRAM 약 36GB 실측 (48GB급), 추론 약 5GB</div></div>
     <div class="req-card"><div class="k">OS</div><div class="v">Linux (권장)</div></div>
     <div class="req-card"><div class="k">디스크</div><div class="v">규모별 2단계 참고</div></div>
-    <div class="req-card"><div class="k">핵심 패키지</div><div class="v">torch, nvidia-physicsnemo</div></div>
+    <div class="req-card"><div class="k">핵심 패키지</div><div class="v">torch, nvidia-physicsnemo 2.2.2 (+패치), cuML</div></div>
   </div>
 </header>
 
@@ -203,15 +203,31 @@ source ~/venvs/domino/bin/activate
 nvidia-smi --query-gpu=driver_version,compute_cap --format=csv
 pip install torch torchvision torchinfo --index-url https://download.pytorch.org/whl/cu130
 
-pip install nvidia-physicsnemo   # warp-lang, pyvista, vtk, hydra-core 등 의존성 자동 설치
+pip install nvidia-physicsnemo==2.2.2   # warp-lang, pyvista, vtk, hydra-core 등 의존성 자동 설치
+
+# GPU용 최근접 이웃(kNN) 검색 라이브러리 - 아래 경고 참고
+pip install cuml-cu13==26.8.0 --extra-index-url=https://pypi.nvidia.com
 
 # pip 패키지에는 학습/추론 "예제 스크립트"가 없으므로 저장소를 따로 클론
 git clone https://github.com/NVIDIA/physicsnemo.git
-cd physicsnemo/examples/cfd/external_aerodynamics/domino/src</code></pre>
+cd physicsnemo/examples/cfd/external_aerodynamics/domino/src
+
+# physicsnemo 2.2.2 버그 패치 (domino-cfd-pipeline-guide 저장소의 scripts/patch_physicsnemo.py)
+python patch_physicsnemo.py</code></pre>
+
+  <div class="callout warn">
+    <div class="tag">경고: 이 두 가지를 빠뜨리면 추론이 실패합니다</div>
+    <ul>
+      <li><strong>physicsnemo 2.2.2 패치</strong> - 2.2.2의 <span class="path">VTKFileReader</span>에 <span class="path">read_file_attributes</span> 함수가 빠져 있어서, 그대로 설치하면 STL 추론이 <span class="path">TypeError: Can't instantiate abstract class VTKFileReader</span>로 바로 멈춥니다. 실제 학습 서버(A6000)에는 이 패치가 이미 들어가 있었고, 새 PC에 설치하다가 발견했습니다. <span class="path">patch_physicsnemo.py</span>를 한 번 실행하면 빈 함수를 채워 넣어 해결됩니다.</li>
+      <li><strong>cuML</strong> - physicsnemo는 kNN 검색에 GPU에서는 cuML을 먼저 쓰고, 없으면 <strong>모든 점 쌍의 거리를 한 번에 계산하는 PyTorch 구현</strong>으로 대체합니다. 이 구현은 메모리를 크게 써서, 12GB GPU(RTX 5070 Ti Laptop)에서 추론 중 <span class="path">CUDA out of memory</span>로 멈췄습니다. 설치 후에는 같은 GPU에서 정상 동작했고, 추론 1회 최대 사용량은 약 5GB였습니다.</li>
+    </ul>
+  </div>
 
   <div class="code-label">설치 검증</div>
   <pre><code>python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-python -c "import physicsnemo; print(physicsnemo.__version__)"</code></pre>
+python -c "import physicsnemo; print(physicsnemo.__version__)"
+# cuML이 kNN에 실제로 잡히는지 (cuml: True 여야 함)
+python -c "from physicsnemo.nn.functional.neighbors.knn.knn import KNN; print({k: v.available for k, v in KNN._get_impls().items()})"</code></pre>
 
   <div class="callout ok">
     <div class="tag">확인 포인트</div>
@@ -505,11 +521,15 @@ def save_surface_prediction(stl_coordinates, stl_faces, output_full,
   <div class="step-head"><span class="step-num">11</span><h2 class="step-title">(선택) 로컬 GPU로 옮기기</h2></div>
   <p class="step-why">왜: 원격 서버 대신 뷰어와 같은 머신(또는 학생 실습용 VM)에서 바로 추론하고 싶을 때.</p>
   <ul class="checklist">
-    <li>대상 GPU가 학습 서버와 같은 CUDA compute capability 세대인지 확인 (다르면 커널 호환성부터 검증)</li>
-    <li>1단계와 동일하게 physicsnemo를 그 머신에 pip으로 설치 (전용 CUDA 툴체인 설치는 불필요)</li>
+    <li>대상 GPU 세대가 달라도 됩니다 - Ampere(A6000)에서 학습한 모델이 Blackwell(RTX 5070 Ti Laptop)에서 그대로 동작했습니다. 같은 PyTorch wheel(cu130)을 쓰면 커널은 설치된 GPU에 맞게 준비됩니다.</li>
+    <li>1단계와 동일하게 physicsnemo 2.2.2를 설치하고, <strong>cuML 설치와 physicsnemo 패치까지 반드시</strong> 적용 (1-5의 경고 참고). 전용 CUDA 툴체인은 불필요</li>
     <li>추론 스크립트 + 체크포인트(.mdlus) + 정규화 통계(scaling_factors.pkl) + 설정 파일만 옮기면 됨 (전체 학습 코드/데이터는 불필요)</li>
-    <li>확장 쪽 코드를 SSH/SCP 호출에서 로컬 subprocess 호출로 교체</li>
+    <li>Windows PC라면 WSL2 안에 위 환경을 만들고, Kit-CAE 확장에서 SSH 대신 <span class="path">wsl.exe</span>로 추론 스크립트를 호출</li>
   </ul>
+  <div class="callout ok">
+    <div class="tag">확인: 실제로 구현한 결과</div>
+    <p>Kit-CAE 확장(<span class="path">domino-predict-kit-extension</span> 저장소)에 <strong>Local (WSL2) / Remote</strong> 전환을 추가했고, WSL 환경은 <span class="path">wsl_setup/setup_local_inference.sh</span> 한 번으로 설치됩니다. 같은 STL로 비교한 결과, 노트북(RTX 5070 Ti Laptop, WSL2) 결과와 A6000 결과의 표면 압력 R²가 0.9999로 사실상 같았습니다. 요청 1회는 A6000 약 66초, 노트북 약 110초였습니다.</p>
+  </div>
   <div class="callout warn">
     <div class="tag">경고: TorchScript/ONNX로는 안 됨</div>
     <p>전처리(SDF, KNN)가 physicsnemo/warp-lang의 커스텀 GPU 커널에 의존하기 때문에, 순수 torch 파일 하나로 내보낼 수 없습니다 (다른 종류의 모델이라면 가능할 수 있습니다). physicsnemo 자체를 설치하는 방식이 유일한 길입니다.</p>
