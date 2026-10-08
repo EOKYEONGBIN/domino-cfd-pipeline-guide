@@ -1107,12 +1107,16 @@ def inference_epoch(
             # its own size per axis) instead of the full dataset-wide domain
             # -- concentrates the same point budget near the body, where
             # local surface features actually show up, instead of spread
-            # across the whole (mostly empty) far-field.
+            # across the whole (mostly empty) far-field. Downstream (+x, the
+            # flow direction) it reaches 3 body lengths instead of 1, so
+            # streamlines can follow the wake like the CFD ones do instead
+            # of ending ~1 body length behind the body.
             stl_min = sample_batched["stl_coordinates"].min(dim=0).values
             stl_max = sample_batched["stl_coordinates"].max(dim=0).values
             stl_size = stl_max - stl_min
             grid_bbox_min = stl_min - stl_size
             grid_bbox_max = stl_max + stl_size
+            grid_bbox_max[0] = stl_max[0] + 3 * stl_size[0]
 
             grid_output_flat, grid_origin, grid_spacing = inference_volume_grid_on_single_stl(
                 sample_batched["stl_coordinates"],
@@ -1364,10 +1368,11 @@ def main(cfg: DictConfig) -> None:
             volume_solution_cfg=dict(cfg.variables.volume.solution)
             if volume_variable_names
             else None,
-            # Coarse first cut (~10 cells across the car's length) purely to
-            # prove the grid/connectivity mechanism works in Kit-CAE --
-            # 128*24*16 = 49152 = 6 * volume_points_sample(8192).
-            volume_grid_dims=(128, 24, 16) if volume_variable_names else None,
+            # x spans 5 body lengths (1 upstream + body + 3 downstream): 256
+            # points keeps the x spacing at ~1/51 of the body length (the old
+            # 128 over 3 lengths was ~1/42). The point count must be a
+            # multiple of volume_points_sample (8192): 256*24*16 = 98304 = 12x.
+            volume_grid_dims=(256, 24, 16) if volume_variable_names else None,
             save_path=to_absolute_path(cfg.eval.save_path),
         )
     epoch_end_time = time.perf_counter()
